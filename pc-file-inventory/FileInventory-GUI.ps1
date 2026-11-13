@@ -26,6 +26,10 @@ New-Item -ItemType Directory -Force -Path $script:reportDir | Out-Null
 $script:scanProcess = $null
 $script:scanStarted = $null
 $script:runnerPath = $null
+$script:operationType = $null
+$script:reviewSourcePath = $null
+$script:reviewResultPath = $null
+$script:reviewCountPath = $null
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'archiva.exe // drive scout'
@@ -132,9 +136,16 @@ $deleteButton.Enabled = $false
 $form.Controls.Add($deleteButton)
 
 $openButton = New-Object System.Windows.Forms.Button
+$reviewButton = New-Object System.Windows.Forms.Button
+$reviewButton.Text = 'review saved CSV'
+$reviewButton.Location = New-Object System.Drawing.Point(872, 164)
+$reviewButton.Size = New-Object System.Drawing.Size(108, 40)
+$form.Controls.Add($reviewButton)
+
+$openButton = New-Object System.Windows.Forms.Button
 $openButton.Text = 'open /reports'
-$openButton.Location = New-Object System.Drawing.Point(872, 164)
-$openButton.Size = New-Object System.Drawing.Size(105, 40)
+$openButton.Location = New-Object System.Drawing.Point(990, 164)
+$openButton.Size = New-Object System.Drawing.Size(100, 40)
 $form.Controls.Add($openButton)
 
 $status = New-Object System.Windows.Forms.Label
@@ -158,6 +169,45 @@ $tabs.TabPages.Add($fileTab) | Out-Null
 $tempTab = New-Object System.Windows.Forms.TabPage
 $tempTab.Text = 'Cleanup review'
 $tabs.TabPages.Add($tempTab) | Out-Null
+
+$searchPanel = New-Object System.Windows.Forms.Panel
+$searchPanel.Location = New-Object System.Drawing.Point(7, 7)
+$searchPanel.Size = New-Object System.Drawing.Size(1035, 36)
+$searchPanel.BackColor = $script:palette.Panel
+$fileTab.Controls.Add($searchPanel)
+
+$searchLabel = New-Object System.Windows.Forms.Label
+$searchLabel.Text = 'Search full CSV'
+$searchLabel.Location = New-Object System.Drawing.Point(5, 9)
+$searchLabel.AutoSize = $true
+$searchLabel.ForeColor = $script:palette.Cyan
+$searchPanel.Controls.Add($searchLabel)
+
+$searchBox = New-Object System.Windows.Forms.TextBox
+$searchBox.Location = New-Object System.Drawing.Point(112, 5)
+$searchBox.Size = New-Object System.Drawing.Size(660, 26)
+$searchBox.BackColor = $script:palette.Surface
+$searchBox.ForeColor = $script:palette.Text
+$searchBox.BorderStyle = 'FixedSingle'
+$searchPanel.Controls.Add($searchBox)
+
+$searchButton = New-Object System.Windows.Forms.Button
+$searchButton.Text = 'find matches'
+$searchButton.Location = New-Object System.Drawing.Point(782, 4)
+$searchButton.Size = New-Object System.Drawing.Size(130, 28)
+$searchButton.FlatStyle = 'Flat'
+$searchButton.BackColor = $script:palette.Blue
+$searchButton.ForeColor = $script:palette.Background
+$searchPanel.Controls.Add($searchButton)
+
+$revealButton = New-Object System.Windows.Forms.Button
+$revealButton.Text = 'show selected'
+$revealButton.Location = New-Object System.Drawing.Point(922, 4)
+$revealButton.Size = New-Object System.Drawing.Size(105, 28)
+$revealButton.FlatStyle = 'Flat'
+$revealButton.BackColor = $script:palette.Surface
+$revealButton.ForeColor = $script:palette.Cyan
+$searchPanel.Controls.Add($revealButton)
 
 function New-Grid {
     param([System.Windows.Forms.Control] $Parent)
@@ -213,9 +263,104 @@ function Test-SafeTempFilePath {
     return $false
 }
 
+function ConvertTo-PowerShellLiteral {
+    param([string] $Value)
+    "'" + $Value.Replace("'", "''") + "'"
+}
+
+function Start-ReportReviewWorker {
+    param([ValidateSet('Largest', 'Search')][string] $Mode, [string] $SourcePath, [string] $Query = '')
+    if ($null -ne $script:scanProcess) { return }
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        $status.ForeColor = $script:palette.Red
+        $status.Text = 'The inventory CSV could not be found.'
+        return
+    }
+
+    $token = [guid]::NewGuid().ToString('N')
+    $script:runnerPath = Join-Path $env:TEMP ('archiva-review-' + $token + '.ps1')
+    $script:reviewResultPath = Join-Path $env:TEMP ('archiva-results-' + $token + '.csv')
+    $script:reviewCountPath = Join-Path $env:TEMP ('archiva-count-' + $token + '.txt')
+    $runnerTemplate = @'
+$source = __SOURCE__
+$output = __OUTPUT__
+$countFile = __COUNTFILE__
+$mode = __MODE__
+$query = __QUERY__
+$rows = [System.Collections.Generic.List[object]]::new()
+$count = 0L
+if ($mode -eq 'Largest') {
+    $largest = [System.Collections.Generic.SortedDictionary[string, object]]::new([System.StringComparer]::Ordinal)
+    $sequence = 0L
+    Import-Csv -LiteralPath $source | ForEach-Object {
+        $key = '{0:D20}-{1:D20}' -f [long]$_.SizeBytes, $sequence
+        $largest[$key] = $_
+        $sequence++
+        if ($largest.Count -gt 500) {
+            $iterator = $largest.GetEnumerator()
+            [void]$iterator.MoveNext()
+            [void]$largest.Remove($iterator.Current.Key)
+        }
+    }
+    foreach ($item in ($largest.Values | Sort-Object { [long]$_.SizeBytes } -Descending)) { $rows.Add($item) }
+    $count = $rows.Count
+} else {
+    Import-Csv -LiteralPath $source | ForEach-Object {
+        if ($_.Path.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $_.Name.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $_.Extension.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $_.Type.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $count++
+            if ($rows.Count -lt 500) { $rows.Add($_) }
+        }
+    }
+}
+if ($rows.Count -gt 0) {
+    $rows | Export-Csv -LiteralPath $output -NoTypeInformation -Encoding UTF8
+} else {
+    '"Path","Name","Extension","SizeBytes","SizeMiB","LastWriteTimeUtc","Type"' | Set-Content -LiteralPath $output -Encoding UTF8
+}
+Set-Content -LiteralPath $countFile -Value $count -Encoding ASCII
+'@
+    $runnerContent = $runnerTemplate
+    $runnerContent = $runnerContent.Replace('__SOURCE__', (ConvertTo-PowerShellLiteral $SourcePath))
+    $runnerContent = $runnerContent.Replace('__OUTPUT__', (ConvertTo-PowerShellLiteral $script:reviewResultPath))
+    $runnerContent = $runnerContent.Replace('__COUNTFILE__', (ConvertTo-PowerShellLiteral $script:reviewCountPath))
+    $runnerContent = $runnerContent.Replace('__MODE__', (ConvertTo-PowerShellLiteral $Mode))
+    $runnerContent = $runnerContent.Replace('__QUERY__', (ConvertTo-PowerShellLiteral $Query))
+    Set-Content -LiteralPath $script:runnerPath -Value $runnerContent -Encoding UTF8
+    $psExe = Join-Path $PSHOME 'powershell.exe'
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $script:runnerPath + '"'
+    try {
+        $script:operationType = 'Review' + $Mode
+        $script:scanProcess = Start-Process -FilePath $psExe -ArgumentList $arguments -WindowStyle Hidden -PassThru
+        $scanButton.Enabled = $false
+        $cleanupButton.Enabled = $false
+        $reviewButton.Enabled = $false
+        $searchButton.Enabled = $false
+        $status.ForeColor = $script:palette.Cyan
+        $status.Text = if ($Mode -eq 'Largest') { 'Reading the report in the background and finding the largest files...' } else { 'Searching the full report in the background...' }
+        $script:timer.Start()
+    } catch {
+        Remove-Item -LiteralPath $script:runnerPath -Force -ErrorAction SilentlyContinue
+        $script:runnerPath = $null
+        $script:operationType = $null
+        $scanButton.Enabled = $true
+        $cleanupButton.Enabled = $true
+        $reviewButton.Enabled = $true
+        $searchButton.Enabled = $true
+        $status.ForeColor = $script:palette.Red
+        $status.Text = 'Could not start report review: ' + $_.Exception.Message
+    }
+}
+
 $typeGrid = New-Grid $typeTab
 $fileGrid = New-Grid $fileTab
 $tempGrid = New-Grid $tempTab
+$fileGrid.Dock = 'None'
+$fileGrid.Location = New-Object System.Drawing.Point(7, 49)
+$fileGrid.Size = New-Object System.Drawing.Size(1035, 340)
+$fileGrid.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $tempGrid.ReadOnly = $false
 $tempGrid.Columns.Clear()
 $tempGrid.AutoGenerateColumns = $false
@@ -285,6 +430,9 @@ $cleanupButton.BackColor = $script:palette.Blue
 $cleanupButton.ForeColor = $script:palette.Background
 $deleteButton.BackColor = $script:palette.Red
 $deleteButton.ForeColor = $script:palette.Background
+$reviewButton.BackColor = $script:palette.Pink
+$reviewButton.ForeColor = $script:palette.Background
+$reviewButton.FlatAppearance.BorderSize = 0
 $openButton.BackColor = $script:palette.Surface
 $tabs.BackColor = $script:palette.Panel
 $tabs.ForeColor = $script:palette.Text
@@ -322,42 +470,68 @@ $script:timer.Add_Tick({
     if ($null -ne $script:scanProcess -and $script:scanProcess.HasExited) {
         $script:timer.Stop()
         $scanExitCode = $script:scanProcess.ExitCode
+        $completedOperation = $script:operationType
         $script:scanProcess = $null
         if ($script:runnerPath -and (Test-Path -LiteralPath $script:runnerPath)) {
             Remove-Item -LiteralPath $script:runnerPath -Force -ErrorAction SilentlyContinue
             $script:runnerPath = $null
         }
         if ($scanExitCode -ne 0) {
-            $status.Text = 'Scan stopped with an error. Check the selected locations and folder permissions.'
+            $status.Text = if ($completedOperation -eq 'Scan') { 'Scan stopped with an error. Check the selected locations and folder permissions.' } else { 'Report review stopped with an error. Check that the CSV can be read.' }
             $status.ForeColor = $script:palette.Red
             $scanButton.Enabled = $true
             $cleanupButton.Enabled = $true
+            $reviewButton.Enabled = $true
+            $searchButton.Enabled = $true
+            $script:operationType = $null
             return
         }
-        try {
-            $summaryFiles = @(Get-ChildItem -LiteralPath $script:reportDir -Filter 'file-summary-*.csv' -File | Where-Object { $_.LastWriteTime -ge $script:scanStarted } | Sort-Object LastWriteTime -Descending)
-            $inventoryFiles = @(Get-ChildItem -LiteralPath $script:reportDir -Filter 'file-inventory-*.csv' -File | Where-Object { $_.LastWriteTime -ge $script:scanStarted } | Sort-Object LastWriteTime -Descending)
-            if ($summaryFiles.Count -gt 0) {
-                $status.ForeColor = $script:palette.Cyan
-                $status.Text = 'Scan complete; loading summary and top 500 files...'
-                $form.Refresh()
-                $typeGrid.DataSource = @(Import-Csv -LiteralPath $summaryFiles[0].FullName)
-                if ($inventoryFiles.Count -gt 0) {
-                    $largest = @(Get-LargestInventoryFiles -InventoryPath $inventoryFiles[0].FullName)
-                    $fileGrid.DataSource = $largest
+        if ($completedOperation -eq 'Scan') {
+            try {
+                $summaryFiles = @(Get-ChildItem -LiteralPath $script:reportDir -Filter 'file-summary-*.csv' -File | Where-Object { $_.LastWriteTime -ge $script:scanStarted } | Sort-Object LastWriteTime -Descending)
+                $inventoryFiles = @(Get-ChildItem -LiteralPath $script:reportDir -Filter 'file-inventory-*.csv' -File | Where-Object { $_.LastWriteTime -ge $script:scanStarted } | Sort-Object LastWriteTime -Descending)
+                if ($summaryFiles.Count -gt 0 -and $inventoryFiles.Count -gt 0) {
+                    $typeGrid.DataSource = @(Import-Csv -LiteralPath $summaryFiles[0].FullName)
+                    $script:reviewSourcePath = $inventoryFiles[0].FullName
+                    $script:operationType = $null
+                    Start-ReportReviewWorker -Mode Largest -SourcePath $script:reviewSourcePath
+                    return
                 }
-                $status.ForeColor = $script:palette.Green
-                $status.Text = ('Scan complete ♡  full CSV reports: ' + $script:reportDir)
-            } else {
-                $status.Text = 'Scan ended without a report. Check the selected locations and folder permissions.'
+                $status.Text = 'Scan ended without complete reports. Check the selected locations and folder permissions.'
+                $status.ForeColor = $script:palette.Red
+            } catch {
+                $status.Text = 'Scan report could not be loaded: ' + $_.Exception.Message
                 $status.ForeColor = $script:palette.Red
             }
-        } catch {
-            $status.Text = 'Scan reports could not be loaded: ' + $_.Exception.Message
-            $status.ForeColor = $script:palette.Red
+        } elseif ($completedOperation -like 'Review*') {
+            try {
+                $rows = @(Import-Csv -LiteralPath $script:reviewResultPath)
+                $count = 0
+                if (Test-Path -LiteralPath $script:reviewCountPath) { $count = [long](Get-Content -LiteralPath $script:reviewCountPath -Raw) }
+                $fileGrid.DataSource = $rows
+                $tabs.SelectedTab = $fileTab
+                $status.ForeColor = $script:palette.Green
+                if ($completedOperation -eq 'ReviewSearch') {
+                    $status.Text = ('Found ' + $count + ' matches; showing up to 500. Use Show selected to open its folder.')
+                } else {
+                    $status.Text = ('Loaded the 500 largest files from ' + $script:reviewSourcePath)
+                }
+            } catch {
+                $status.Text = 'Could not load review results: ' + $_.Exception.Message
+                $status.ForeColor = $script:palette.Red
+            } finally {
+                foreach ($path in @($script:reviewResultPath, $script:reviewCountPath)) {
+                    if ($path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+                }
+                $script:reviewResultPath = $null
+                $script:reviewCountPath = $null
+            }
         }
         $scanButton.Enabled = $true
         $cleanupButton.Enabled = $true
+        $reviewButton.Enabled = $true
+        $searchButton.Enabled = $true
+        $script:operationType = $null
     }
 })
 
@@ -377,6 +551,82 @@ $outputBrowse.Add_Click({
 })
 $openButton.Add_Click({
     if (Test-Path -LiteralPath $outputBox.Text) { Start-Process explorer.exe -ArgumentList ('"' + $outputBox.Text + '"') }
+})
+$reviewButton.Add_Click({
+    if ($null -ne $script:scanProcess) { return }
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = 'Choose an Archiva CSV report'
+    $dialog.InitialDirectory = if (Test-Path -LiteralPath $outputBox.Text) { $outputBox.Text } else { $script:reportDir }
+    $dialog.Filter = 'Archiva reports|file-inventory-*.csv;file-summary-*.csv|All CSV files|*.csv'
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    $directory = Split-Path -Parent $dialog.FileName
+    $name = [IO.Path]::GetFileName($dialog.FileName)
+    if ($name -match '^file-inventory-(.+)\.csv$') {
+        $stamp = $Matches[1]
+        $inventoryPath = $dialog.FileName
+        $summaryPath = Join-Path $directory ('file-summary-' + $stamp + '.csv')
+    } elseif ($name -match '^file-summary-(.+)\.csv$') {
+        $stamp = $Matches[1]
+        $summaryPath = $dialog.FileName
+        $inventoryPath = Join-Path $directory ('file-inventory-' + $stamp + '.csv')
+    } else {
+        [System.Windows.Forms.MessageBox]::Show('Choose a file named file-summary-*.csv or file-inventory-*.csv.', 'Not an Archiva report', 'OK', 'Information') | Out-Null
+        return
+    }
+    if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+        [System.Windows.Forms.MessageBox]::Show('The matching summary CSV was not found beside this report.', 'Incomplete report set', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $script:reportDir = $directory
+    $outputBox.Text = $directory
+    $script:reviewSourcePath = if (Test-Path -LiteralPath $inventoryPath -PathType Leaf) { $inventoryPath } else { $null }
+    $typeGrid.DataSource = @(Import-Csv -LiteralPath $summaryPath)
+    $tabs.SelectedTab = $typeTab
+    if ($script:reviewSourcePath) {
+        Start-ReportReviewWorker -Mode Largest -SourcePath $script:reviewSourcePath
+    } else {
+        $status.ForeColor = $script:palette.Red
+        $status.Text = 'Summary loaded, but its full inventory CSV is missing. Search and file actions need both files.'
+    }
+})
+$searchButton.Add_Click({
+    if ($null -ne $script:scanProcess) { return }
+    if (-not $script:reviewSourcePath) {
+        [System.Windows.Forms.MessageBox]::Show('Load a saved scan first using review saved CSV.', 'No report loaded', 'OK', 'Information') | Out-Null
+        return
+    }
+    $query = $searchBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($query)) {
+        [System.Windows.Forms.MessageBox]::Show('Enter part of a path, file name, extension, or type.', 'Search query needed', 'OK', 'Information') | Out-Null
+        return
+    }
+    Start-ReportReviewWorker -Mode Search -SourcePath $script:reviewSourcePath -Query $query
+})
+$typeGrid.Add_DoubleClick({
+    if ($null -eq $typeGrid.CurrentRow) { return }
+    $type = [string]$typeGrid.CurrentRow.Cells['Type'].Value
+    if ([string]::IsNullOrWhiteSpace($type)) { return }
+    $searchBox.Text = if ($type -eq 'No extension') { $type } else { '.' + $type.ToLowerInvariant() }
+    $searchButton.PerformClick()
+})
+$searchBox.Add_KeyDown({
+    if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+        $searchButton.PerformClick()
+        $_.SuppressKeyPress = $true
+    }
+})
+$revealButton.Add_Click({
+    if ($null -eq $fileGrid.CurrentRow) {
+        [System.Windows.Forms.MessageBox]::Show('Select a file row first.', 'No file selected', 'OK', 'Information') | Out-Null
+        return
+    }
+    $path = [string]$fileGrid.CurrentRow.Cells['Path'].Value
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        [System.Windows.Forms.MessageBox]::Show('That file is no longer available at this path.', 'File not found', 'OK', 'Information') | Out-Null
+        return
+    }
+    Start-Process -FilePath explorer.exe -ArgumentList ('/select,"' + $path + '"')
 })
 $scanButton.Add_Click({
     if ($null -ne $script:scanProcess) { return }
@@ -407,6 +657,7 @@ $scanButton.Add_Click({
     $runnerContent = "& '" + $scriptPath + "' -Root @(" + $rootValues + ") -OutputDirectory '" + $outValue + "'"
     Set-Content -LiteralPath $runner -Value $runnerContent -Encoding UTF8
     $script:scanStarted = Get-Date
+    $script:operationType = 'Scan'
     $psExe = Join-Path $PSHOME 'powershell.exe'
     $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $runner + '"'
     try {
@@ -414,6 +665,7 @@ $scanButton.Add_Click({
     } catch {
         Remove-Item -LiteralPath $runner -Force -ErrorAction SilentlyContinue
         $script:runnerPath = $null
+        $script:operationType = $null
         $scanButton.Enabled = $true
         $cleanupButton.Enabled = $true
         $status.ForeColor = $script:palette.Red
@@ -502,8 +754,8 @@ $deleteButton.Add_Click({
 $form.Add_FormClosing({
     if ($null -ne $script:scanProcess -and -not $script:scanProcess.HasExited) {
         $answer = [System.Windows.Forms.MessageBox]::Show(
-            'A scan is still running. Stop it and close Archiva?',
-            'Scan in progress', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning
+            'A scan or report review is still running. Stop it and close Archiva?',
+            'Operation in progress', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning
         )
         if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
             $_.Cancel = $true
@@ -517,4 +769,3 @@ $form.Add_FormClosing({
 })
 
 [void]$form.ShowDialog()
-
