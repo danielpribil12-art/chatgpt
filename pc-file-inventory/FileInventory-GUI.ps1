@@ -301,7 +301,17 @@ $tabs.Add_DrawItem({
     $flags = [System.Drawing.StringFormat]::GenericDefault
     $flags.Alignment = [System.Drawing.StringAlignment]::Center
     $flags.LineAlignment = [System.Drawing.StringAlignment]::Center
-    $eventArgs.Graphics.DrawString($page.Text, $sender.Font, $textBrush, $eventArgs.Bounds, $flags)
+    $bounds = $eventArgs.Bounds
+    $layout = [System.Drawing.RectangleF]::new(
+        [single]$bounds.X, [single]$bounds.Y, [single]$bounds.Width, [single]$bounds.Height
+    )
+    $eventArgs.Graphics.DrawString(
+        [string]$page.Text,
+        [System.Drawing.Font]$sender.Font,
+        [System.Drawing.Brush]$textBrush,
+        [System.Drawing.RectangleF]$layout,
+        [System.Drawing.StringFormat]$flags
+    )
     $fillBrush.Dispose()
     $textBrush.Dispose()
 })
