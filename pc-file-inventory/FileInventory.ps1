@@ -1,4 +1,4 @@
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+﻿[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
     [string[]] $Root,
     [string] $OutputDirectory = (Get-Location).Path,
@@ -22,7 +22,16 @@ function Get-DefaultRoots {
 }
 
 function Get-FileInventory {
-    param([string[]] $ScanRoots)
+    param(
+        [string[]] $ScanRoots,
+        [hashtable] $TypeTotals,
+        [string] $ExcludeDirectory,
+        [string[]] $ExcludeFiles
+    )
+    $excludedPath = [IO.Path]::GetFullPath($ExcludeDirectory)
+    $volumeRoot = [IO.Path]::GetPathRoot($excludedPath)
+    if ([string]::Equals($excludedPath, $volumeRoot, [StringComparison]::OrdinalIgnoreCase)) { $excludedPath = $null }
+    else { $excludedPath = $excludedPath.TrimEnd('\') }
     foreach ($scanRoot in $ScanRoots) {
         if (-not (Test-Path -LiteralPath $scanRoot -PathType Container)) {
             Write-Warning ('Skipping missing or inaccessible root: ' + $scanRoot)
@@ -33,16 +42,26 @@ function Get-FileInventory {
         $stack.Push((Get-Item -LiteralPath $scanRoot -Force).FullName)
         while ($stack.Count -gt 0) {
             $current = $stack.Pop()
+            $currentFullPath = [IO.Path]::GetFullPath($current).TrimEnd('\')
+            if ($excludedPath -and ([string]::Equals($currentFullPath, $excludedPath, [StringComparison]::OrdinalIgnoreCase) -or
+                $currentFullPath.StartsWith($excludedPath + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase))) { continue }
             try { $children = Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop }
             catch { Write-Verbose ('Skipped inaccessible folder: ' + $current); continue }
             foreach ($item in $children) {
                 try {
+                    if ($ExcludeFiles -contains $item.FullName) { continue }
                     if ($item.PSIsContainer) {
                         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push($item.FullName) }
                         continue
                     }
                     $extension = $item.Extension.ToLowerInvariant()
                     if ([string]::IsNullOrWhiteSpace($extension)) { $extension = '[no extension]' }
+                    $type = if ($extension -eq '[no extension]') { 'No extension' } else { $extension.TrimStart('.').ToUpperInvariant() }
+                    if (-not $TypeTotals.ContainsKey($type)) {
+                        $TypeTotals[$type] = [pscustomobject]@{ FileCount = 0L; TotalBytes = 0L }
+                    }
+                    $TypeTotals[$type].FileCount++
+                    $TypeTotals[$type].TotalBytes += [long]$item.Length
                     [pscustomobject]@{
                         Path = $item.FullName
                         Name = $item.Name
@@ -50,7 +69,7 @@ function Get-FileInventory {
                         SizeBytes = [long]$item.Length
                         SizeMiB = [math]::Round($item.Length / 1MB, 3)
                         LastWriteTimeUtc = $item.LastWriteTimeUtc.ToString('o')
-                        Type = if ($extension -eq '[no extension]') { 'No extension' } else { $extension.TrimStart('.').ToUpperInvariant() }
+                        Type = $type
                     }
                 } catch { Write-Verbose ('Skipped file that could not be read: ' + $item.FullName) }
             }
@@ -74,25 +93,55 @@ function Test-InAllowedTempRoot {
     return $false
 }
 
+function Test-SafeTempFile {
+    param([string] $Path, [string[]] $AllowedRoots)
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path)
+        foreach ($allowedRoot in $AllowedRoots) {
+            $fullRoot = [IO.Path]::GetFullPath($allowedRoot).TrimEnd('\')
+            if (-not $fullPath.StartsWith($fullRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $currentPath = $fullPath
+            while ($currentPath) {
+                $current = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
+                if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+                if ([string]::Equals([IO.Path]::GetFullPath($current.FullName).TrimEnd('\'), $fullRoot, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+                $parent = [IO.Directory]::GetParent($currentPath)
+                if ($null -eq $parent -or $parent.FullName -eq $currentPath) { break }
+                $currentPath = $parent.FullName
+            }
+        }
+    } catch { return $false }
+    return $false
+}
+
 function Export-JunkCandidates {
     param([string] $Destination, [int] $AgeDays)
     $allowedRoots = @(Get-AllowedTempRoots)
     if ($allowedRoots.Count -eq 0) { throw 'No user temporary folders were found.' }
     $cutoff = (Get-Date).AddDays(-$AgeDays)
-    $results = foreach ($rootPath in $allowedRoots) {
-        Get-ChildItem -LiteralPath $rootPath -File -Force -Recurse -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.LastWriteTime -lt $cutoff -and $_.Extension -match '^\.(tmp|temp)$' -and
-                (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
-            } |
-            ForEach-Object {
-                [pscustomobject]@{
-                    Path = $_.FullName
-                    SizeBytes = [long]$_.Length
-                    LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString('o')
-                    Reason = 'Old .' + $_.Extension.TrimStart('.') + ' file inside user temp folder'
+    $results = [System.Collections.Generic.List[object]]::new()
+    foreach ($rootPath in $allowedRoots) {
+        $stack = [System.Collections.Generic.Stack[string]]::new()
+        $stack.Push($rootPath)
+        while ($stack.Count -gt 0) {
+            $folder = $stack.Pop()
+            try { $children = Get-ChildItem -LiteralPath $folder -Force -ErrorAction Stop } catch { continue }
+            foreach ($item in $children) {
+                if ($item.PSIsContainer) {
+                    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push($item.FullName) }
+                    continue
+                }
+                if ($item.LastWriteTime -lt $cutoff -and $item.Extension -match '^\.(tmp|temp)$' -and
+                    (Test-SafeTempFile -Path $item.FullName -AllowedRoots $allowedRoots)) {
+                    $results.Add([pscustomobject]@{
+                        Path = $item.FullName
+                        SizeBytes = [long]$item.Length
+                        LastWriteTimeUtc = $item.LastWriteTimeUtc.ToString('o')
+                        Reason = 'Old .' + $item.Extension.TrimStart('.') + ' file inside user temp folder'
+                    })
                 }
             }
+        }
     }
     $results | Export-Csv -LiteralPath $Destination -NoTypeInformation -Encoding UTF8
     Write-Host ('Wrote ' + @($results).Count + ' cleanup candidates to ' + $Destination)
@@ -117,7 +166,7 @@ function Remove-ReviewedCandidates {
         }
         try {
             $file = Get-Item -LiteralPath $candidatePath -Force -ErrorAction Stop
-            if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            if ($file.PSIsContainer -or -not (Test-SafeTempFile -Path $file.FullName -AllowedRoots $allowedRoots) -or
                 $file.Extension -notmatch '^\.(tmp|temp)$' -or $file.LastWriteTime -ge (Get-Date).AddDays(-$OlderThanDays)) {
                 Write-Warning ('Rejected file that no longer matches cleanup rules: ' + $candidatePath)
                 continue
@@ -152,16 +201,27 @@ New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $inventoryPath = Join-Path $OutputDirectory ('file-inventory-' + $stamp + '.csv')
 $summaryPath = Join-Path $OutputDirectory ('file-summary-' + $stamp + '.csv')
-$inventory = @(Get-FileInventory -ScanRoots $Root)
-$inventory | Export-Csv -LiteralPath $inventoryPath -NoTypeInformation -Encoding UTF8
-$summary = $inventory | Group-Object Type | ForEach-Object {
-    $totalBytes = ($_.Group | Measure-Object -Property SizeBytes -Sum).Sum
-    [pscustomobject]@{ Type = $_.Name; FileCount = $_.Count; TotalBytes = [long]$totalBytes; TotalMiB = [math]::Round($totalBytes / 1MB, 3) }
-} | Sort-Object TotalBytes -Descending
+$typeTotals = @{}
+$fileCount = 0L
+Get-FileInventory -ScanRoots $Root -TypeTotals $typeTotals -ExcludeDirectory $OutputDirectory -ExcludeFiles @($inventoryPath, $summaryPath) |
+    ForEach-Object { $fileCount++; $_ } |
+    Export-Csv -LiteralPath $inventoryPath -NoTypeInformation -Encoding UTF8
+if (-not (Test-Path -LiteralPath $inventoryPath) -or (Get-Item -LiteralPath $inventoryPath).Length -eq 0) {
+    '"Path","Name","Extension","SizeBytes","SizeMiB","LastWriteTimeUtc","Type"' |
+        Set-Content -LiteralPath $inventoryPath -Encoding UTF8
+}
+$summary = foreach ($type in $typeTotals.Keys) {
+    $totals = $typeTotals[$type]
+    [pscustomobject]@{ Type = $type; FileCount = $totals.FileCount; TotalBytes = $totals.TotalBytes; TotalMiB = [math]::Round($totals.TotalBytes / 1MB, 3) }
+}
+$summary = @($summary | Sort-Object TotalBytes -Descending)
 $summary | Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+if (-not (Test-Path -LiteralPath $summaryPath) -or (Get-Item -LiteralPath $summaryPath).Length -eq 0) {
+    '"Type","FileCount","TotalBytes","TotalMiB"' | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+}
 Write-Host ('Inventory: ' + $inventoryPath)
 Write-Host ('Summary:   ' + $summaryPath)
-Write-Host ('Files found: ' + $inventory.Count)
+Write-Host ('Files found: ' + $fileCount)
 Write-Host 'Largest types:'
 $summary | Select-Object -First 15 | Format-Table -AutoSize
 if ($FindJunk) {
